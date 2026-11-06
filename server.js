@@ -306,10 +306,14 @@ app.post('/api/auth/logout', async (req, res) => {
 // Change the password for the currently authenticated account.
 // The new bcrypt hash is stored in Neon; the old password stops working on the next login.
 app.post('/api/auth/change-password', requireAuth, authLimiter, async (req, res) => {
-  const currentPassword = String(req.body?.currentPassword ?? req.body?.oldPassword ?? '');
+  // Acepta ambos nombres para mantener compatibilidad con versiones anteriores del cliente.
+  const currentPassword = String(
+    req.body?.currentPassword ?? req.body?.oldPassword ?? ''
+  );
+
   let newPassword;
   try {
-    newPassword = normalizePassword(req.body?.newPassword);
+    newPassword = normalizePassword(req.body?.newPassword ?? req.body?.password);
   } catch (error) {
     return jsonError(res, error);
   }
@@ -321,55 +325,106 @@ app.post('/api/auth/change-password', requireAuth, authLimiter, async (req, res)
     return res.status(400).json({ error: 'La nueva contraseña debe ser diferente de la actual.' });
   }
 
-  const client = await pool.connect();
+  let client;
+  let transactionOpen = false;
+
   try {
+    client = await pool.connect();
     await client.query('BEGIN');
+    transactionOpen = true;
+
+    // Bloquea la fila para impedir cambios simultáneos de contraseña en la misma cuenta.
     const found = await client.query(
-      'SELECT id, password_hash FROM ssi_users WHERE id=$1 FOR UPDATE',
+      'SELECT id, password_hash FROM ssi_users WHERE id = $1 FOR UPDATE',
       [req.session.userId]
     );
-    if (!found.rowCount) {
+
+    if (found.rowCount !== 1) {
       await client.query('ROLLBACK');
-      return res.status(401).json({ error: 'La cuenta ya no está disponible. Inicia sesión otra vez.' });
+      transactionOpen = false;
+      return res.status(401).json({
+        error: 'La cuenta ya no está disponible. Inicia sesión otra vez.'
+      });
     }
 
-    const validCurrentPassword = await bcrypt.compare(currentPassword, found.rows[0].password_hash);
-    if (!validCurrentPassword) {
-      await client.query('ROLLBACK');
-      return res.status( currentPassword ? 400 : 401 ).json({ error: 'La contraseña actual es incorrecta.' });
-    }
-
-    const passwordHash = await bcrypt.hash(newPassword, 12);
-    await client.query(
-      'UPDATE ssi_users SET password_hash=$1, updated_at=NOW() WHERE id=$2',
-      [passwordHash, req.session.userId]
+    // Comprueba la contraseña actual contra el hash almacenado en Neon.
+    const currentIsValid = await bcrypt.compare(
+      currentPassword,
+      found.rows[0].password_hash
     );
-    await client.query('COMMIT');
 
-    // Revoke this account's other device sessions while keeping this browser signed in.
-    // express-pg-session stores the serialized session in the "sess" JSONB column.
-
-    try {
-      const sessions = await pool.query('SELECT sid, sess FROM ssi_sessions');
-      for (const row of sessions.rows) {
-        let sessObj = row.sess;
-        if (typeof sessObj === 'string') { try { sessObj = JSON.parse(sessObj); } catch { sessObj = null; } }
-        const owner = sessObj?.userId ?? sessObj?.passport?.user ?? null;
-        if (String(owner) === String(req.session.userId) && String(row.sid) !== String(req.sessionID)) {
-          await pool.query('DELETE FROM ssi_sessions WHERE sid=$1', [row.sid]);
-        }
-      }
-    } catch (error) {
-      console.warn('No se pudieron cerrar todas las otras sesiones:', error.message);
+    if (!currentIsValid) {
+      await client.query('ROLLBACK');
+      transactionOpen = false;
+      return res.status(400).json({ error: 'La contraseña actual es incorrecta.' });
     }
-    
 
-    res.json({ ok: true, message: 'Contraseña actualizada. Usa la nueva contraseña al iniciar sesión en otros dispositivos.' });
+    // Nunca se guarda la contraseña en texto plano.
+    const newPasswordHash = await bcrypt.hash(newPassword, 12);
+
+    // RETURNING garantiza que PostgreSQL confirmó que se modificó la cuenta.
+    const updated = await client.query(
+      `UPDATE ssi_users
+       SET password_hash = $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, password_hash`,
+      [newPasswordHash, req.session.userId]
+    );
+
+    if (updated.rowCount !== 1) {
+      throw new Error('Neon no confirmó la actualización de la contraseña.');
+    }
+
+    // Lee de nuevo la fila dentro de la transacción y verifica el hash persistido.
+    const verification = await client.query(
+      'SELECT password_hash FROM ssi_users WHERE id = $1',
+      [req.session.userId]
+    );
+
+    if (
+      verification.rowCount !== 1 ||
+      verification.rows[0].password_hash !== newPasswordHash ||
+      !(await bcrypt.compare(newPassword, verification.rows[0].password_hash))
+    ) {
+      throw new Error('La verificación de la contraseña guardada en Neon falló.');
+    }
+
+    // Solo se informa éxito después de que Neon confirma el COMMIT.
+    await client.query('COMMIT');
+    transactionOpen = false;
+
+    // Revoca las sesiones de otros dispositivos de esta cuenta, conservando esta sesión.
+    // connect-pg-simple guarda la sesión serializada en la columna JSONB "sess".
+    try {
+      await pool.query(
+        `DELETE FROM ssi_sessions
+         WHERE sid <> $1
+           AND (
+             sess->>'userId' = $2
+             OR sess->'passport'->>'user' = $2
+           )`,
+        [req.sessionID, String(req.session.userId)]
+      );
+    } catch (sessionError) {
+      // El cambio de contraseña ya quedó confirmado; no se revierte por este paso secundario.
+      console.warn(
+        'La contraseña se guardó en Neon, pero no se pudieron revocar todas las demás sesiones:',
+        sessionError.message
+      );
+    }
+
+    return res.json({
+      ok: true,
+      message: 'Contraseña actualizada y verificada en Neon. En otros dispositivos, inicia sesión con la nueva contraseña.'
+    });
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
-    jsonError(res, error);
+    if (client && transactionOpen) {
+      await client.query('ROLLBACK').catch(() => {});
+      transactionOpen = false;
+    }
+    return jsonError(res, error);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 

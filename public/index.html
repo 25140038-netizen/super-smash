@@ -5300,8 +5300,11 @@ function gameLoop(timestamp) {
           method: 'POST',
           body: JSON.stringify({ currentPassword, newPassword })
         });
+        if (result?.ok !== true) {
+          throw new Error(result?.message || 'El servidor no confirmó que Neon guardó la nueva contraseña.');
+        }
         if (form) form.reset();
-        showMessage(result.message || '¡Contraseña actualizada en tu cuenta de la nube! Usa la nueva contraseña la próxima vez que inicies sesión.');
+        showMessage(result.message || '¡Contraseña actualizada y confirmada en Neon! Usa la nueva contraseña al iniciar sesión en otros dispositivos.');
       } catch (error) {
         console.error('No se pudo cambiar la contraseña:', error);
         if (error.status === 404) {
