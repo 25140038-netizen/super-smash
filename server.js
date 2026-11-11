@@ -1,0 +1,940 @@
+import 'dotenv/config';
+import crypto from 'node:crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import express from 'express';
+import session from 'express-session';
+import connectPgSimple from 'connect-pg-simple';
+import pg from 'pg';
+import bcrypt from 'bcryptjs';
+import helmet from 'helmet';
+import { rateLimit } from 'express-rate-limit';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PORT = Number(process.env.PORT || 3000);
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const SESSION_SECRET = process.env.SESSION_SECRET || '';
+const DATABASE_URL = process.env.DATABASE_URL || '';
+
+if (!DATABASE_URL) {
+  console.error('Falta DATABASE_URL. Copia .env.example a .env y configura una base de datos PostgreSQL.');
+  process.exit(1);
+}
+if (IS_PRODUCTION && SESSION_SECRET.length < 32) {
+  console.error('En producción, SESSION_SECRET debe ser una cadena privada de al menos 32 caracteres.');
+  process.exit(1);
+}
+
+const { Pool } = pg;
+const pool = new Pool({ connectionString: DATABASE_URL, max: 10, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000 });
+const PgStore = connectPgSimple(session);
+const app = express();
+app.disable('x-powered-by');
+if (IS_PRODUCTION) app.set('trust proxy', 1);
+
+// Keep the CDNs used by the existing game while adding security headers.
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", 'https://cdn.tailwindcss.com', 'https://cdnjs.cloudflare.com', 'https://unpkg.com'],
+      styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com', 'https://cdnjs.cloudflare.com'],
+      fontSrc: ["'self'", 'https://fonts.gstatic.com', 'https://cdnjs.cloudflare.com', 'data:'],
+      imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
+      connectSrc: ["'self'", 'https:', 'wss:'],
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"],
+      frameAncestors: ["'none'"]
+    }
+  },
+  crossOriginEmbedderPolicy: false
+}));
+app.use(express.json({ limit: '32kb' }));
+app.use(express.urlencoded({ extended: false, limit: '8kb' }));
+app.use(session({
+  name: 'ssi.sid',
+  store: new PgStore({ pool, tableName: 'ssi_sessions', createTableIfMissing: true, pruneSessionInterval: 60 * 15 }),
+  secret: SESSION_SECRET || crypto.randomBytes(48).toString('hex'),
+  resave: false,
+  saveUninitialized: false,
+  rolling: true,
+  cookie: {
+    httpOnly: true,
+    secure: IS_PRODUCTION,
+    sameSite: 'lax',
+    maxAge: 30 * 24 * 60 * 60 * 1000,
+    path: '/'
+  }
+}));
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 12,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Demasiados intentos. Espera unos minutos e inténtalo otra vez.' }
+});
+const matchLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 40,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Demasiadas solicitudes de partida. Inténtalo de nuevo en un momento.' }
+});
+// Límite propio para el cambio de contraseña: así los intentos de inicio de
+// sesión no agotan el cupo y bloquean (429) un cambio de contraseña legítimo.
+const passwordLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Demasiados intentos de cambio de contraseña. Espera unos minutos e inténtalo otra vez.' }
+});
+
+const CHARACTER_PRICES = Object.freeze({
+  warrior: 0,
+  ninja: 100,
+  pyro: 200,
+  titan: 350,
+  cyber: 500,
+  gold_warrior: 10000,
+  emerald_phantom: 25000,
+  ruby_destroyer: 50000,
+  void_walker: 100000,
+  omega_supreme: 150000,
+   sonic_roller: 200000,
+   cryo_blaster: 250000,
+   random_glitch: 300000
+ });
+
+const VALID_CHARACTERS = new Set(Object.keys(CHARACTER_PRICES));
+
+// Catálogo de accesorios del HTML: 20 IDs estables, cuatro por zona.
+const ACCESSORY_TYPES_BY_ID = Object.freeze(Object.fromEntries(
+  Array.from({ length: 5 }, (_, group) =>
+    Array.from({ length: 4 }, (_, index) => [`acc_${group * 10 + index + 1}`, ['Gorros', 'Collares', 'Gafas', 'Máscaras', 'Espaldas'][group]])
+  ).flat()
+));
+const ACCESSORY_PRICES = Object.freeze(Object.fromEntries(
+  Array.from({ length: 5 }, (_, group) =>
+    Array.from({ length: 4 }, (_, index) => [`acc_${group * 10 + index + 1}`, [500, 5000, 50000, 1000000][index]])
+  ).flat()
+));
+
+function defaultProfile() {
+  return {
+    coins: 0,
+    cups: 0,
+    wins: 0,
+    unlockedChars: ['warrior'],
+    selectedChar: 'warrior',
+    keyBindings: {},
+    touchPositions: {},
+    forceTouch: false,
+    unlockedAccessories: [], equippedAccessories: {}, unlockedMapSkins: [], selectedMapSkin: 'default',
+    streakCount: 0, streakLastClaimDate: null, streakClaimedToday: false, streakCycleStartDate: null, streakBlockedUntil: null, streakRewards: [], dailyQuestDate: null, dailyQuests: [], weeklyRewardWeek: null, unlockedTitles: []
+  };
+}
+function safeProfile(value) {
+  const fallback = defaultProfile();
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : fallback;
+  const unlocked = Array.isArray(source.unlockedChars)
+    ? [...new Set(source.unlockedChars.filter(id => VALID_CHARACTERS.has(id)))].slice(0, VALID_CHARACTERS.size)
+    : ['warrior'];
+  if (!unlocked.includes('warrior')) unlocked.unshift('warrior');
+  return {
+    coins: clampInt(source.coins, 0, 2_000_000_000, 0),
+    cups: clampInt(source.cups, 0, 2_000_000_000, 0),
+    wins: clampInt(source.wins, 0, 2_000_000_000, 0),
+    unlockedChars: unlocked,
+    selectedChar: VALID_CHARACTERS.has(source.selectedChar) && unlocked.includes(source.selectedChar) ? source.selectedChar : 'warrior',
+    keyBindings: sanitizeSmallObject(source.keyBindings, 8_000),
+    touchPositions: sanitizeSmallObject(source.touchPositions, 8_000),
+    forceTouch: source.forceTouch === true,
+    unlockedAccessories: [...new Set((Array.isArray(source.unlockedAccessories) ? source.unlockedAccessories : []).filter(id => Object.prototype.hasOwnProperty.call(ACCESSORY_TYPES_BY_ID, String(id))))].slice(0, 20),
+    equippedAccessories: sanitizeAccessoryEquipment(source.equippedAccessories, source.unlockedAccessories),
+    unlockedMapSkins: [...new Set((Array.isArray(source.unlockedMapSkins) ? source.unlockedMapSkins : []).filter(id => /^[a-z0-9_-]{1,32}$/.test(String(id)) && id !== 'default'))].slice(0, 20),
+    selectedMapSkin: /^[a-z0-9_-]{1,32}$/.test(String(source.selectedMapSkin || 'default')) ? String(source.selectedMapSkin || 'default') : 'default',
+    streakCount: clampInt(source.streakCount, 0, 7, 0), streakLastClaimDate: /^\d{4}-\d{2}-\d{2}$/.test(String(source.streakLastClaimDate || '')) ? source.streakLastClaimDate : null,
+    streakClaimedToday: source.streakClaimedToday === true, streakCycleStartDate: /^\d{4}-\d{2}-\d{2}$/.test(String(source.streakCycleStartDate || '')) ? source.streakCycleStartDate : null, streakBlockedUntil: /^\d{4}-\d{2}-\d{2}$/.test(String(source.streakBlockedUntil || '')) ? source.streakBlockedUntil : null, streakRewards: Array.isArray(source.streakRewards) ? source.streakRewards.slice(0,7).map(r => ({type:['coins','cups','accessory','map','weekly'].includes(r?.type)?r.type:'coins', amount:clampInt(r?.amount,0,100000000,0), id:/^[a-z0-9_-]{1,32}$/.test(String(r?.id||''))?String(r.id):null})) : [], dailyQuestDate: /^\d{4}-\d{2}-\d{2}$/.test(String(source.dailyQuestDate || '')) ? source.dailyQuestDate : null,
+    dailyQuests: Array.isArray(source.dailyQuests) ? source.dailyQuests.slice(0,3).map(q => ({ id:String(q.id||''), type:String(q.type||''), description:String(q.description||''), target:clampInt(q.target,1,100000,1), progress:clampInt(q.progress,0,100000,0), reward:clampInt(q.reward,0,1000000,0), rewardType:q.rewardType==='cups'?'cups':'coins', completed:q.completed===true || Number(q.progress)>=Number(q.target), claimed:q.claimed===true })) : [],
+    weeklyRewardWeek: typeof source.weeklyRewardWeek === 'string' ? source.weeklyRewardWeek : null,
+    unlockedTitles: [...new Set((Array.isArray(source.unlockedTitles)?source.unlockedTitles:[]).filter(x=>typeof x==='string'&&x.length<=60))].slice(0,30)
+  };
+}
+function clampInt(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+function sanitizeSmallObject(value, maxBytes) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  try {
+    const encoded = JSON.stringify(value);
+    if (Buffer.byteLength(encoded, 'utf8') > maxBytes) return {};
+    const parsed = JSON.parse(encoded);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch { return {}; }
+}
+function sanitizeAccessoryEquipment(value, unlockedValue) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const unlocked = new Set(Array.isArray(unlockedValue) ? unlockedValue.map(String) : []);
+  const clean = {};
+  for (const [type, idValue] of Object.entries(source)) {
+    const id = String(idValue || '');
+    if (ACCESSORY_TYPES_BY_ID[id] === type && unlocked.has(id)) clean[type] = id;
+  }
+  return clean;
+}
+function normalizeUsername(value) {
+  const username = String(value ?? '').trim();
+  if (!/^[A-Za-z0-9_-]{3,16}$/.test(username)) {
+    const err = new Error('El nombre debe tener entre 3 y 16 caracteres y usar solo letras, números, guion o guion bajo.');
+    err.status = 400;
+    throw err;
+  }
+  return { username, usernameKey: username.toLowerCase() };
+}
+function normalizePassword(value) {
+  const password = String(value ?? '');
+  const length = Buffer.byteLength(password, 'utf8');
+  if (password.length < 8 || length > 72) {
+    const err = new Error('La contraseña debe tener al menos 8 caracteres y como máximo 72 bytes.');
+    err.status = 400;
+    throw err;
+  }
+  return password;
+}
+function publicUser(row) {
+  return { id: row.id, username: row.username, profile: safeProfile(row.profile), createdAt: row.created_at, isAdmin: row.role === 'admin' };
+}
+function isDuplicateKey(error) { return error?.code === '23505'; }
+function requireAuth(req, res, next) {
+  if (!req.session?.userId) return res.status(401).json({ error: 'Inicia sesión para continuar.' });
+  next();
+}
+async function requireAdmin(req, res, next) {
+  if (!req.session?.userId) return res.status(401).json({ error: 'Inicia sesión para continuar.' });
+  try {
+    const result = await pool.query('SELECT role FROM ssi_users WHERE id=$1', [req.session.userId]);
+    if (result.rows[0]?.role !== 'admin') return res.status(403).json({ error: 'No tienes permisos de administrador.' });
+    next();
+  } catch (error) { jsonError(res, error); }
+}
+async function recordAdminAction(adminId, action, targetId = null, details = {}) {
+  try {
+    await pool.query('INSERT INTO ssi_admin_logs (admin_id, action, target_user_id, details) VALUES ($1,$2,$3,$4::jsonb)',
+      [adminId, action, targetId, JSON.stringify(sanitizeSmallObject(details, 2000))]);
+  } catch (error) { console.warn('No se pudo guardar el registro de administración:', error.message); }
+}
+function setupKeyMatches(provided) {
+  const expected = process.env.ADMIN_SETUP_KEY || '';
+  const a = Buffer.from(String(provided || ''), 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  return expected.length >= 32 && a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+function saveSession(req) {
+  return new Promise((resolve, reject) => req.session.save(error => error ? reject(error) : resolve()));
+}
+function rotateSession(req) {
+  return new Promise((resolve, reject) => req.session.regenerate(error => error ? reject(error) : resolve()));
+}
+function destroySession(req) {
+  return new Promise(resolve => req.session.destroy(() => resolve()));
+}
+function jsonError(res, error) {
+  if (error?.code === '23505') return res.status(409).json({ error: 'Ese nombre de cuenta ya está ocupado. Elige otro.' });
+  const status = Number(error?.status) || 500;
+  if (status >= 500) console.error(error);
+  return res.status(status).json({ error: status >= 500 ? 'Error del servidor. Inténtalo de nuevo.' : error.message });
+}
+async function fetchUserById(id, client = pool) {
+  const result = await client.query('SELECT id, username, profile, created_at, role FROM ssi_users WHERE id = $1', [id]);
+  return result.rows[0] || null;
+}
+function calcCupDelta(baseWin, baseLoss, currentCups, isWin) {
+  const cups = Number(currentCups) || 0;
+  if (isWin) {
+    let mult = 1;
+    if (cups >= 750000) mult = 0.2;
+    else if (cups >= 500000) mult = 0.3;
+    else if (cups >= 250000) mult = 0.4;
+    else if (cups >= 100000) mult = 0.55;
+    else if (cups >= 50000) mult = 0.7;
+    else if (cups >= 10000) mult = 0.85;
+    return Math.max(1, Math.round(baseWin * mult));
+  }
+  let mult = 0.5;
+  if (cups >= 750000) mult = 2.5;
+  else if (cups >= 500000) mult = 2;
+  else if (cups >= 250000) mult = 1.7;
+  else if (cups >= 100000) mult = 1.4;
+  else if (cups >= 50000) mult = 1.2;
+  else if (cups >= 10000) mult = 1;
+  return -Math.round(baseLoss * mult);
+}
+function zombieCoinsForWaves(waves) {
+  let total = 0;
+  for (let wave = 1; wave <= waves; wave++) {
+    total += wave * 30;
+    if (wave <= 200 && wave % 10 === 0) {
+      const tier = wave / 10;
+      total += tier * 500 + tier * tier * 50;
+    }
+  }
+  return total;
+}
+
+// Recompensas de zombis más altas. No disminuyen antes de 10,000 copas;
+// desde ese punto bajan gradualmente conforme crece el total del jugador.
+// Se conserva un mínimo de 1 copa por partida completada.
+function zombieCupMultiplier(currentCups) {
+  const cups = Math.max(0, Number(currentCups) || 0);
+  if (cups >= 1_000_000) return 0.30;
+  if (cups >= 500_000) return 0.50;
+  if (cups >= 250_000) return 0.80;
+  if (cups >= 100_000) return 1.20;
+  if (cups >= 50_000) return 1.60;
+  if (cups >= 25_000) return 2.00;
+  if (cups >= 10_000) return 2.50;
+  return 3.00;
+}
+
+const ACCESSORY_REWARD_PRICES = Object.fromEntries([1,2,3,4,11,12,13,14,21,22,23,24,31,32,33,34,41,42,43,44].map((id,i)=>[`acc_${id}`,[500,5000,50000,1000000][i%4]]));
+const ACCESSORY_REWARD_IDS = Object.keys(ACCESSORY_REWARD_PRICES);
+const MAP_REWARD_PRICES = {fire:800,sunset:1500,ice:2500,candy:4000,toxic:5000,volcano:8000,desert:15000,sakura:30000,neon:60000,gold:250000,rainbow:1000000};
+const QUEST_POOL = [
+  {type:'damage',description:'Inflige 500 de daño total',target:500},
+  {type:'damage',description:'Inflige 1,200 de daño total',target:1200},
+  {type:'matches',description:'Juega 2 partidas',target:2},
+  {type:'matches',description:'Juega 4 partidas',target:4},
+  {type:'wins',description:'Gana 1 partida',target:1},
+  {type:'wins',description:'Gana 3 partidas',target:3},
+  {type:'specials',description:'Usa 5 habilidades especiales',target:5},
+  {type:'specials',description:'Usa 10 habilidades especiales',target:10}
+];
+const GAME_TIME_ZONE = process.env.GAME_TIME_ZONE || 'America/Mexico_City';
+function utcDate(d=new Date()){const parts=new Intl.DateTimeFormat('en-CA',{timeZone:GAME_TIME_ZONE,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(d);const v=Object.fromEntries(parts.map(x=>[x.type,x.value]));return `${v.year}-${v.month}-${v.day}`;}
+function shiftDate(date,days){const d=new Date(`${date}T12:00:00.000Z`);d.setUTCDate(d.getUTCDate()+days);return d.toISOString().slice(0,10);}
+function dateDiff(from,to){return Math.round((new Date(`${to}T12:00:00Z`)-new Date(`${from}T12:00:00Z`))/86400000);}
+function weekKey(date=utcDate()){const d=new Date(`${date}T12:00:00.000Z`);const day=(d.getUTCDay()+6)%7;d.setUTCDate(d.getUTCDate()-day+3);const first=new Date(Date.UTC(d.getUTCFullYear(),0,4));const week=1+Math.round(((d-first)/86400000-3+((first.getUTCDay()+6)%7))/7);return `${d.getUTCFullYear()}-W${String(week).padStart(2,'0')}`;}
+function newDailyQuests(date){const pool=[...QUEST_POOL];for(let i=pool.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[pool[i],pool[j]]=[pool[j],pool[i]];}return pool.slice(0,3).map((q,i)=>({...q,id:`${date}-${i}-${crypto.randomBytes(3).toString('hex')}`,reward:100+Math.floor(Math.random()*501),rewardType:Math.random()<0.22?'cups':'coins',progress:0,completed:false,claimed:false}));}
+function makeStreakRewards(){return [
+ {type:'coins',amount:100},{type:'coins',amount:200},{type:'cups',amount:100},{type:'coins',amount:400},
+ Math.random()<0.22?{type:'accessory',id:ACCESSORY_REWARD_IDS[Math.floor(Math.random()*ACCESSORY_REWARD_IDS.length)]}:{type:'coins',amount:500+Math.floor(Math.random()*301)},
+ Math.random()<0.12?{type:'map',id:Object.keys(MAP_REWARD_PRICES)[Math.floor(Math.random()*Object.keys(MAP_REWARD_PRICES).length)]}:(Math.random()<0.5?{type:'cups',amount:150+Math.floor(Math.random()*151)}:{type:'coins',amount:700+Math.floor(Math.random()*501)}),
+ {type:'weekly',amount:0}
+];}
+function refreshStreakState(profile,today){
+ profile.streakClaimedToday=profile.streakLastClaimDate===today;
+ if(profile.streakClaimedToday){profile.streakBlockedUntil=null;return profile;}
+ if(!profile.streakLastClaimDate){profile.streakCount=0;profile.streakBlockedUntil=null;profile.streakCycleStartDate=null;return profile;}
+ if(profile.streakLastClaimDate===shiftDate(today,-1)){profile.streakBlockedUntil=null;if((profile.streakCount||0)>=7){profile.streakCount=0;profile.streakLastClaimDate=null;profile.streakCycleStartDate=null;profile.streakRewards=[];}return profile;}
+ const start=profile.streakCycleStartDate||shiftDate(profile.streakLastClaimDate,-Math.max(0,(profile.streakCount||1)-1));
+ const unlock=shiftDate(start,7);
+ if(today<unlock){profile.streakCount=0;profile.streakCycleStartDate=start;profile.streakBlockedUntil=unlock;}
+ else{profile.streakCount=0;profile.streakLastClaimDate=null;profile.streakClaimedToday=false;profile.streakCycleStartDate=null;profile.streakBlockedUntil=null;profile.streakRewards=[];}
+ return profile;
+}
+function applyStreakPrize(profile,prize,date){
+ if(prize.type==='coins'){profile.coins=Math.min(2000000000,profile.coins+prize.amount);return {type:'coins',amount:prize.amount};}
+ if(prize.type==='cups'){profile.cups=Math.min(2000000000,profile.cups+prize.amount);return {type:'cups',amount:prize.amount};}
+ if(prize.type==='accessory'){
+  if(!profile.unlockedAccessories.includes(prize.id)){profile.unlockedAccessories.push(prize.id);return {type:'accessory',id:prize.id};}
+  const amount=ACCESSORY_REWARD_PRICES[prize.id]||500;profile.coins=Math.min(2000000000,profile.coins+amount);return {type:'coins',amount,duplicate:prize.id};
+ }
+ if(prize.type==='map'){
+  if(!profile.unlockedMapSkins.includes(prize.id)){profile.unlockedMapSkins.push(prize.id);return {type:'map',id:prize.id};}
+  const amount=MAP_REWARD_PRICES[prize.id]||500;profile.coins=Math.min(2000000000,profile.coins+amount);return {type:'coins',amount,duplicate:prize.id};
+ }
+ return rewardWeeklyItem(profile,date);
+}
+function rewardWeeklyBonus(profile){
+  // 0.15% personaje: nunca se incluyen los tres personajes más recientes.
+  const roll=Math.random();
+  if(roll<0.0015){const ordered=[...VALID_CHARACTERS];const newest=new Set(ordered.slice(-3));const eligible=ordered.filter(id=>!newest.has(id));const id=eligible[Math.floor(Math.random()*eligible.length)];if(!profile.unlockedChars.includes(id)){profile.unlockedChars.push(id);return {type:'character',id,name:id};}profile.coins=Math.min(2000000000,profile.coins+CHARACTER_PRICES[id]);return {type:'coins',amount:CHARACTER_PRICES[id],duplicate:id};}
+  if(roll<0.09){const id=ACCESSORY_REWARD_IDS[Math.floor(Math.random()*ACCESSORY_REWARD_IDS.length)];if(!profile.unlockedAccessories.includes(id)){profile.unlockedAccessories.push(id);return {type:'accessory',id};}const refund=ACCESSORY_REWARD_PRICES[id];profile.coins=Math.min(2000000000,profile.coins+refund);return {type:'coins',amount:refund,duplicate:id};}
+  if(roll<0.13){const ids=Object.keys(MAP_REWARD_PRICES);const id=ids[Math.floor(Math.random()*ids.length)];if(!profile.unlockedMapSkins.includes(id)){profile.unlockedMapSkins.push(id);return {type:'map',id};}const refund=MAP_REWARD_PRICES[id];profile.coins=Math.min(2000000000,profile.coins+refund);return {type:'coins',amount:refund,duplicate:id};}
+  if(roll<0.48){const amount=500+Math.floor(Math.random()*1501);profile.coins=Math.min(2000000000,profile.coins+amount);return {type:'coins',amount};}
+  const amount=100+Math.floor(Math.random()*401);profile.cups=Math.min(2000000000,profile.cups+amount);return {type:'cups',amount};
+}
+function rewardWeeklyItem(profile,date){const title=`Racha de 7 días ${weekKey(date)}`;const duplicate=profile.unlockedTitles.includes(title);if(!duplicate)profile.unlockedTitles.push(title);else profile.coins=Math.min(2000000000,profile.coins+500);return {type:'weekly',title:duplicate?null:title,titleDuplicate:duplicate,bonus:rewardWeeklyBonus(profile)};}
+function ensureDailyQuests(profile,date){if(profile.dailyQuestDate!==date){profile.dailyQuestDate=date;profile.dailyQuests=newDailyQuests(date);}return profile;}
+
+app.get('/api/health', async (_req, res) => {
+  try { await pool.query('SELECT 1'); res.json({ ok: true, database: 'connected' }); }
+  catch { res.status(503).json({ ok: false, database: 'unavailable' }); }
+});
+
+app.post('/api/auth/register', authLimiter, async (req, res) => {
+  try {
+    const { username, usernameKey } = normalizeUsername(req.body?.username);
+    const password = normalizePassword(req.body?.password);
+    const passwordHash = await bcrypt.hash(password, 12);
+    const id = crypto.randomUUID();
+    const profile = defaultProfile();
+    const result = await pool.query(
+      'INSERT INTO ssi_users (id, username, username_key, password_hash, profile) VALUES ($1,$2,$3,$4,$5::jsonb) RETURNING id, username, profile, created_at, role',
+      [id, username, usernameKey, passwordHash, JSON.stringify(profile)]
+    );
+    await rotateSession(req);
+    req.session.userId = result.rows[0].id;
+    await saveSession(req);
+    res.status(201).json({ user: publicUser(result.rows[0]) });
+  } catch (error) { jsonError(res, error); }
+});
+
+app.post('/api/auth/login', authLimiter, async (req, res) => {
+  try {
+    const rawUsername = String(req.body?.username ?? '').trim();
+    const password = String(req.body?.password ?? '');
+    if (!/^[A-Za-z0-9_-]{3,16}$/.test(rawUsername) || !password || Buffer.byteLength(password, 'utf8') > 72) {
+      return res.status(401).json({ error: 'Nombre o contraseña incorrectos.' });
+    }
+    const result = await pool.query(
+      'SELECT id, username, password_hash, profile, created_at, role FROM ssi_users WHERE username_key = $1',
+      [rawUsername.toLowerCase()]
+    );
+    const row = result.rows[0];
+    if (!row || !(await bcrypt.compare(password, row.password_hash))) {
+      return res.status(401).json({ error: 'Nombre o contraseña incorrectos.' });
+    }
+    await rotateSession(req);
+    req.session.userId = row.id;
+    await saveSession(req);
+    res.json({ user: publicUser(row) });
+  } catch (error) { jsonError(res, error); }
+});
+
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  try {
+    const row = await fetchUserById(req.session.userId);
+    if (!row) { await destroySession(req); return res.status(401).json({ error: 'La cuenta ya no está disponible. Inicia sesión otra vez.' }); }
+    res.json({ user: publicUser(row) });
+  } catch (error) { jsonError(res, error); }
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  await destroySession(req);
+  res.clearCookie('ssi.sid', { httpOnly: true, secure: IS_PRODUCTION, sameSite: 'lax', path: '/' });
+  res.json({ ok: true });
+});
+
+// Change the password for the currently authenticated account.
+// The new bcrypt hash is stored in Neon; the old password stops working on the next login.
+async function changePasswordHandler(req, res) {
+  // Acepta ambos nombres para mantener compatibilidad con versiones anteriores del cliente.
+  const currentPassword = String(
+    req.body?.currentPassword ?? req.body?.oldPassword ?? ''
+  );
+
+  let newPassword;
+  try {
+    newPassword = normalizePassword(req.body?.newPassword ?? req.body?.password);
+  } catch (error) {
+    return jsonError(res, error);
+  }
+
+  if (!currentPassword || Buffer.byteLength(currentPassword, 'utf8') > 72) {
+    return res.status(400).json({ error: 'Escribe tu contraseña actual.' });
+  }
+  if (currentPassword === newPassword) {
+    return res.status(400).json({ error: 'La nueva contraseña debe ser diferente de la actual.' });
+  }
+
+  let client;
+  let transactionOpen = false;
+
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    transactionOpen = true;
+
+    // Bloquea la fila para impedir cambios simultáneos de contraseña en la misma cuenta.
+    const found = await client.query(
+      'SELECT id, password_hash FROM ssi_users WHERE id = $1 FOR UPDATE',
+      [req.session.userId]
+    );
+
+    if (found.rowCount !== 1) {
+      await client.query('ROLLBACK');
+      transactionOpen = false;
+      return res.status(401).json({
+        error: 'La cuenta ya no está disponible. Inicia sesión otra vez.'
+      });
+    }
+
+    // Comprueba la contraseña actual contra el hash almacenado en Neon.
+    const currentIsValid = await bcrypt.compare(
+      currentPassword,
+      found.rows[0].password_hash
+    );
+
+    if (!currentIsValid) {
+      await client.query('ROLLBACK');
+      transactionOpen = false;
+      return res.status(400).json({ error: 'La contraseña actual es incorrecta.' });
+    }
+
+    // Nunca se guarda la contraseña en texto plano.
+    const newPasswordHash = await bcrypt.hash(newPassword, 12);
+
+    // RETURNING garantiza que PostgreSQL confirmó que se modificó la cuenta.
+    const updated = await client.query(
+      `UPDATE ssi_users
+       SET password_hash = $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, password_hash`,
+      [newPasswordHash, req.session.userId]
+    );
+
+    if (updated.rowCount !== 1) {
+      throw new Error('Neon no confirmó la actualización de la contraseña.');
+    }
+
+    // Lee de nuevo la fila dentro de la transacción y verifica el hash persistido.
+    const verification = await client.query(
+      'SELECT password_hash FROM ssi_users WHERE id = $1',
+      [req.session.userId]
+    );
+
+    if (
+      verification.rowCount !== 1 ||
+      verification.rows[0].password_hash !== newPasswordHash ||
+      !(await bcrypt.compare(newPassword, verification.rows[0].password_hash))
+    ) {
+      throw new Error('La verificación de la contraseña guardada en Neon falló.');
+    }
+
+    // Solo se informa éxito después de que Neon confirma el COMMIT.
+    await client.query('COMMIT');
+    transactionOpen = false;
+
+    // Revoca las sesiones de otros dispositivos de esta cuenta, conservando esta sesión.
+    // connect-pg-simple guarda la sesión serializada en la columna JSONB "sess".
+    try {
+      await pool.query(
+        `DELETE FROM ssi_sessions
+         WHERE sid <> $1
+           AND (
+             sess->>'userId' = $2
+             OR sess->'passport'->>'user' = $2
+           )`,
+        [req.sessionID, String(req.session.userId)]
+      );
+    } catch (sessionError) {
+      // El cambio de contraseña ya quedó confirmado; no se revierte por este paso secundario.
+      console.warn(
+        'La contraseña se guardó en Neon, pero no se pudieron revocar todas las demás sesiones:',
+        sessionError.message
+      );
+    }
+
+    res.set('Cache-Control', 'no-store');
+    return res.json({
+      ok: true,
+      verified: true,
+      message: 'Contraseña actualizada y verificada en Neon. En otros dispositivos, inicia sesión con la nueva contraseña.'
+    });
+  } catch (error) {
+    if (client && transactionOpen) {
+      await client.query('ROLLBACK').catch(() => {});
+      transactionOpen = false;
+    }
+    return jsonError(res, error);
+  } finally {
+    if (client) client.release();
+  }
+}
+app.post('/api/auth/change-password', requireAuth, passwordLimiter, changePasswordHandler);
+// Compatibility alias for older game clients / cached HTML deployments.
+app.post('/api/account/change-password', requireAuth, passwordLimiter, changePasswordHandler);
+
+app.patch('/api/account/username', requireAuth, async (req, res) => {
+  try {
+    const { username, usernameKey } = normalizeUsername(req.body?.username);
+    const result = await pool.query(
+      'UPDATE ssi_users SET username=$1, username_key=$2, updated_at=NOW() WHERE id=$3 RETURNING id, username, profile, created_at, role',
+      [username, usernameKey, req.session.userId]
+    );
+    if (!result.rowCount) return res.status(401).json({ error: 'Inicia sesión otra vez.' });
+    res.json({ user: publicUser(result.rows[0]) });
+  } catch (error) { jsonError(res, error); }
+});
+
+// Admin bootstrap: only the first account that knows the private Render secret can claim the single admin slot.
+app.get('/api/admin/status', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT role, EXISTS(SELECT 1 FROM ssi_users WHERE role='admin') AS admin_exists FROM ssi_users WHERE id=$1", [req.session.userId]);
+    if (!result.rowCount) return res.status(401).json({ error: 'Inicia sesión otra vez.' });
+    res.json({ isAdmin: result.rows[0].role === 'admin', canClaim: !result.rows[0].admin_exists && (process.env.ADMIN_SETUP_KEY || '').length >= 32 });
+  } catch (error) { jsonError(res, error); }
+});
+
+app.post('/api/admin/claim', requireAuth, authLimiter, async (req, res) => {
+  if (!setupKeyMatches(req.body?.setupKey)) return res.status(403).json({ error: 'Clave de activación incorrecta.' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('ssi_single_admin_claim'))");
+    const existing = await client.query("SELECT id FROM ssi_users WHERE role='admin' LIMIT 1");
+    if (existing.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Ya existe una cuenta administradora. No se puede reclamar otra.' }); }
+    const updated = await client.query("UPDATE ssi_users SET role='admin', updated_at=NOW() WHERE id=$1 RETURNING id, username, profile, created_at, role", [req.session.userId]);
+    if (!updated.rowCount) { await client.query('ROLLBACK'); return res.status(401).json({ error: 'Inicia sesión otra vez.' }); }
+    await client.query('COMMIT');
+    await recordAdminAction(req.session.userId, 'claim_admin');
+    res.json({ user: publicUser(updated.rows[0]), isAdmin: true });
+  } catch (error) { await client.query('ROLLBACK').catch(() => {}); jsonError(res, error); }
+  finally { client.release(); }
+});
+
+app.get('/api/admin/overview', requireAdmin, async (req, res) => {
+  try {
+    const [users, matches] = await Promise.all([
+      pool.query("SELECT id, username, role, profile, created_at FROM ssi_users ORDER BY created_at DESC LIMIT 100"),
+      pool.query("SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE finished_at IS NULL)::int AS unfinished FROM ssi_matches")
+    ]);
+    res.json({ users: users.rows.map(row => ({ id: row.id, username: row.username, isAdmin: row.role === 'admin', coins: safeProfile(row.profile).coins, characters: safeProfile(row.profile).unlockedChars.length, createdAt: row.created_at })), stats: { users: users.rowCount, matches: matches.rows[0].total, unfinishedMatches: matches.rows[0].unfinished } });
+  } catch (error) { jsonError(res, error); }
+});
+
+app.post('/api/admin/users/:id/coins', requireAdmin, async (req, res) => {
+  const targetId = String(req.params.id || '');
+  const amount = Number(req.body?.amount);
+  if (!/^[0-9a-f-]{36}$/i.test(targetId) || !Number.isInteger(amount) || amount < 1 || amount > 1000000) return res.status(400).json({ error: 'Cantidad o jugador no válido. Usa entre 1 y 1,000,000 monedas.' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const found = await client.query('SELECT id, username, profile FROM ssi_users WHERE id=$1 FOR UPDATE', [targetId]);
+    if (!found.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'No se encontró esa cuenta.' }); }
+    const profile = safeProfile(found.rows[0].profile);
+    profile.coins = Math.min(2000000000, profile.coins + amount);
+    const updated = await client.query('UPDATE ssi_users SET profile=$1::jsonb, updated_at=NOW() WHERE id=$2 RETURNING username, profile', [JSON.stringify(profile), targetId]);
+    await client.query('COMMIT');
+    await recordAdminAction(req.session.userId, 'grant_coins', targetId, { amount });
+    res.json({ ok: true, username: updated.rows[0].username, coins: safeProfile(updated.rows[0].profile).coins });
+  } catch (error) { await client.query('ROLLBACK').catch(() => {}); jsonError(res, error); }
+  finally { client.release(); }
+});
+
+app.post('/api/admin/users/:id/unlock-all', requireAdmin, async (req, res) => {
+  const targetId = String(req.params.id || '');
+  if (!/^[0-9a-f-]{36}$/i.test(targetId)) return res.status(400).json({ error: 'Jugador no válido.' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const found = await client.query('SELECT id, username, profile FROM ssi_users WHERE id=$1 FOR UPDATE', [targetId]);
+    if (!found.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'No se encontró esa cuenta.' }); }
+    const profile = safeProfile(found.rows[0].profile);
+    profile.unlockedChars = [...VALID_CHARACTERS];
+    const updated = await client.query('UPDATE ssi_users SET profile=$1::jsonb, updated_at=NOW() WHERE id=$2 RETURNING username', [JSON.stringify(profile), targetId]);
+    await client.query('COMMIT');
+    await recordAdminAction(req.session.userId, 'unlock_all_characters', targetId);
+    res.json({ ok: true, username: updated.rows[0].username, unlocked: profile.unlockedChars.length });
+  } catch (error) { await client.query('ROLLBACK').catch(() => {}); jsonError(res, error); }
+  finally { client.release(); }
+});
+
+// This endpoint syncs only settings. Currency and unlocks are changed by dedicated server routes.
+app.put('/api/profile', requireAuth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Lock and re-read the row so a settings save cannot overwrite coins/rewards
+    // written concurrently by a match finishing on another device.
+    const selected = await client.query('SELECT id, username, profile, created_at, role FROM ssi_users WHERE id=$1 FOR UPDATE', [req.session.userId]);
+    if (!selected.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ error: 'Inicia sesión otra vez.' });
+    }
+    const row = selected.rows[0];
+    const profile = safeProfile(row.profile);
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.selectedChar && profile.unlockedChars.includes(body.selectedChar) && VALID_CHARACTERS.has(body.selectedChar)) {
+      profile.selectedChar = body.selectedChar;
+    }
+    if (body.keyBindings !== undefined) profile.keyBindings = sanitizeSmallObject(body.keyBindings, 8000);
+    if (body.touchPositions !== undefined) profile.touchPositions = sanitizeSmallObject(body.touchPositions, 8000);
+    if (body.forceTouch !== undefined) profile.forceTouch = body.forceTouch === true;
+    const updated = await client.query(
+      'UPDATE ssi_users SET profile=$1::jsonb, updated_at=NOW() WHERE id=$2 RETURNING id, username, profile, created_at, role',
+      [JSON.stringify(profile), req.session.userId]
+    );
+    await client.query('COMMIT');
+    res.json({ user: publicUser(updated.rows[0]) });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    jsonError(res, error);
+  } finally { client.release(); }
+});
+
+// Compras y equipamiento de accesorios: Neon es la fuente de verdad.
+app.post('/api/accessories/action', requireAuth, async (req, res) => {
+  const action = String(req.body?.action || '');
+  const accessoryId = String(req.body?.accessoryId || '');
+  const type = ACCESSORY_TYPES_BY_ID[accessoryId];
+  if (!type) return res.status(400).json({ error: 'Ese accesorio no existe.' });
+  if (!['purchase', 'equip', 'unequip'].includes(action)) return res.status(400).json({ error: 'Acción de accesorio no válida.' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const found = await client.query(
+      'SELECT id, username, profile, created_at, role FROM ssi_users WHERE id=$1 FOR UPDATE',
+      [req.session.userId]
+    );
+    if (!found.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ error: 'Inicia sesión otra vez.' });
+    }
+    const row = found.rows[0];
+    const profile = safeProfile(row.profile);
+    const owned = profile.unlockedAccessories.includes(accessoryId);
+    if (action === 'purchase') {
+      if (!owned) {
+        const price = ACCESSORY_PRICES[accessoryId];
+        if (row.role !== 'admin' && profile.coins < price) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: `Necesitas ${price.toLocaleString('es-MX')} monedas para comprar este accesorio.` });
+        }
+        if (row.role !== 'admin') profile.coins -= price;
+        profile.unlockedAccessories.push(accessoryId);
+      }
+    } else if (action === 'equip') {
+      if (!owned) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: 'Primero debes desbloquear este accesorio.' });
+      }
+      profile.equippedAccessories[type] = accessoryId;
+    } else {
+      if (profile.equippedAccessories[type] === accessoryId) delete profile.equippedAccessories[type];
+    }
+    const updated = await client.query(
+      'UPDATE ssi_users SET profile=$1::jsonb, updated_at=NOW() WHERE id=$2 RETURNING id, username, profile, created_at, role',
+      [JSON.stringify(profile), row.id]
+    );
+    await client.query('COMMIT');
+    return res.json({ user: publicUser(updated.rows[0]), action, accessoryId });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    return jsonError(res, error);
+  } finally { client.release(); }
+});
+
+app.post('/api/shop/purchase', requireAuth, async (req, res) => {
+  const charId = String(req.body?.characterId || '');
+  if (!VALID_CHARACTERS.has(charId)) return res.status(400).json({ error: 'Ese personaje no está disponible.' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const selected = await client.query('SELECT id, username, profile, created_at, role FROM ssi_users WHERE id=$1 FOR UPDATE', [req.session.userId]);
+    if (!selected.rowCount) { await client.query('ROLLBACK'); return res.status(401).json({ error: 'Inicia sesión otra vez.' }); }
+    const row = selected.rows[0];
+    const profile = safeProfile(row.profile);
+    if (profile.unlockedChars.includes(charId)) {
+      profile.selectedChar = charId;
+    } else {
+      const price = CHARACTER_PRICES[charId];
+      if (profile.coins < price) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: `Necesitas ${price.toLocaleString('es-MX')} monedas para comprar este personaje.` });
+      }
+      profile.coins -= price;
+      profile.unlockedChars.push(charId);
+      profile.selectedChar = charId;
+    }
+    const updated = await client.query('UPDATE ssi_users SET profile=$1::jsonb, updated_at=NOW() WHERE id=$2 RETURNING id, username, profile, created_at, role', [JSON.stringify(profile), row.id]);
+    await client.query('COMMIT');
+    res.json({ user: publicUser(updated.rows[0]) });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    jsonError(res, error);
+  } finally { client.release(); }
+});
+
+app.post('/api/matches/start', requireAuth, matchLimiter, async (req, res) => {
+  try {
+    const mode = String(req.body?.mode || '');
+    const difficulty = String(req.body?.difficulty || 'normal');
+    if (!['bot', 'zombies', 'multiplayer'].includes(mode)) return res.status(400).json({ error: 'Modo de partida no válido.' });
+    if (!['normal', 'hard', 'nightmare'].includes(difficulty)) return res.status(400).json({ error: 'Dificultad no válida.' });
+    const matchId = crypto.randomUUID();
+    await pool.query('INSERT INTO ssi_matches (id, user_id, mode, difficulty) VALUES ($1,$2,$3,$4)', [matchId, req.session.userId, mode, difficulty]);
+    res.status(201).json({ matchId });
+  } catch (error) { jsonError(res, error); }
+});
+
+app.post('/api/matches/finish', requireAuth, matchLimiter, async (req, res) => {
+  const matchId = String(req.body?.matchId || '');
+  if (!/^[0-9a-f-]{36}$/i.test(matchId)) return res.status(400).json({ error: 'Partida no válida.' });
+  const outcome = req.body?.result === 'win' ? 'win' : req.body?.result === 'loss' ? 'loss' : '';
+  if (!outcome) return res.status(400).json({ error: 'Resultado de partida no válido.' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const found = await client.query('SELECT * FROM ssi_matches WHERE id=$1 AND user_id=$2 FOR UPDATE', [matchId, req.session.userId]);
+    if (!found.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'No se encontró esa partida de tu cuenta.' }); }
+    const match = found.rows[0];
+    if (match.finished_at) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Esta partida ya recibió su recompensa.' }); }
+    const elapsedSeconds = Math.max(0, (Date.now() - new Date(match.started_at).getTime()) / 1000);
+    if (elapsedSeconds < 4.25) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'La partida debe empezar y durar un poco más antes de reclamar su resultado.' }); }
+
+    const userResult = await client.query('SELECT id, username, profile, created_at, role FROM ssi_users WHERE id=$1 FOR UPDATE', [req.session.userId]);
+    const row = userResult.rows[0];
+    const profile = safeProfile(row.profile);
+    let coins = 0, cups = 0, wins = 0;
+    if (match.mode === 'zombies') {
+      const reportedWaves = clampInt(req.body?.completedWaves, 0, 500, 0);
+      // El administrador puede avanzar oleadas rápidamente con el botón ADMIN.
+      // No se le aplica el límite por tiempo: las oleadas saltadas también cuentan
+      // y sus copas se guardan en el perfil de Neon al finalizar la partida.
+      // A los jugadores normales sí se les conserva el límite anti-abuso.
+      const isAdmin = row.role === 'admin';
+      const timeBound = isAdmin ? 500 : Math.min(500, Math.floor(elapsedSeconds / 2) + 2);
+      const completedWaves = Math.min(reportedWaves, timeBound);
+      coins = zombieCoinsForWaves(completedWaves);
+      // Recompensa base mejorada: más copas por oleada y por jefe.
+      // Después se aplica un multiplicador decreciente según las copas actuales.
+      let baseZombieCups = 0;
+      for (let wave = 1; wave <= completedWaves; wave++) {
+        baseZombieCups += 12 + wave * 2;
+        if (wave <= 200 && wave % 10 === 0) {
+          const tier = wave / 10;
+          const bossReward = tier * 500 + tier * tier * 50;
+          baseZombieCups += Math.floor(bossReward / 20);
+        }
+      }
+      cups = completedWaves > 0
+        ? Math.max(1, Math.floor(baseZombieCups * zombieCupMultiplier(profile.cups)))
+        : 0;
+      wins = (completedWaves > 0 && outcome === 'win') ? 1 : 0;
+    } else {
+      const won = outcome === 'win';
+      if (match.mode === 'multiplayer') {
+        coins = won ? 15 : 0;
+        cups = calcCupDelta(50, 30, profile.cups, won);
+      } else {
+        const config = match.difficulty === 'normal' ? { coins: 50, win: 35, loss: 20 }
+          : match.difficulty === 'hard' ? { coins: 120, win: 80, loss: 45 }
+          : { coins: 300, win: 200, loss: 90 };
+        coins = won ? config.coins : 0;
+        cups = calcCupDelta(config.win, config.loss, profile.cups, won);
+      }
+      wins = won ? 1 : 0;
+    }
+    profile.coins = Math.min(2_000_000_000, profile.coins + coins);
+    const oldCups = profile.cups;
+    profile.cups = Math.max(0, Math.min(2_000_000_000, profile.cups + cups));
+    cups = profile.cups - oldCups;
+    profile.wins = Math.min(2_000_000_000, profile.wins + wins);
+    const updated = await client.query('UPDATE ssi_users SET profile=$1::jsonb, updated_at=NOW() WHERE id=$2 RETURNING id, username, profile, created_at, role', [JSON.stringify(profile), row.id]);
+    await client.query('UPDATE ssi_matches SET finished_at=NOW(), result=$1, reward_coins=$2, reward_cups=$3 WHERE id=$4', [outcome, coins, cups, matchId]);
+    await client.query('COMMIT');
+    res.json({ user: publicUser(updated.rows[0]), reward: { coins, cups, wins } });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    jsonError(res, error);
+  } finally { client.release(); }
+});
+
+app.get('/api/daily/state', requireAuth, async (req,res)=>{
+ const client=await pool.connect();try{await client.query('BEGIN');const q=await client.query('SELECT id,username,profile,created_at,role FROM ssi_users WHERE id=$1 FOR UPDATE',[req.session.userId]);if(!q.rowCount){await client.query('ROLLBACK');return res.status(401).json({error:'Inicia sesión otra vez.'});}
+ const row=q.rows[0],profile=safeProfile(row.profile),today=utcDate();ensureDailyQuests(profile,today);refreshStreakState(profile,today);
+ const u=await client.query('UPDATE ssi_users SET profile=$1::jsonb,updated_at=NOW() WHERE id=$2 RETURNING id,username,profile,created_at,role',[JSON.stringify(profile),row.id]);await client.query('COMMIT');
+ res.json({user:publicUser(u.rows[0]),today,week:weekKey(today),streakRewards:[100,200,300,400,500,700,1000],streakBlockedUntil:profile.streakBlockedUntil,streakDaysRemaining:profile.streakBlockedUntil?Math.max(0,dateDiff(today,profile.streakBlockedUntil)):0});
+ }catch(e){await client.query('ROLLBACK').catch(()=>{});jsonError(res,e);}finally{client.release();}
+});
+app.post('/api/daily/streak/claim', requireAuth, async(req,res)=>{
+ const client=await pool.connect();try{await client.query('BEGIN');const q=await client.query('SELECT id,username,profile,created_at,role FROM ssi_users WHERE id=$1 FOR UPDATE',[req.session.userId]);if(!q.rowCount){await client.query('ROLLBACK');return res.status(401).json({error:'Inicia sesión otra vez.'});}
+ const row=q.rows[0],p=safeProfile(row.profile),today=utcDate();refreshStreakState(p,today);
+ if(p.streakClaimedToday){await client.query('ROLLBACK');return res.status(409).json({error:'Ya reclamaste la recompensa de hoy.'});}
+ if(p.streakBlockedUntil&&today<p.streakBlockedUntil){const days=dateDiff(today,p.streakBlockedUntil);await client.query('ROLLBACK');return res.status(423).json({error:`Perdiste la racha. Los premios volverán a desbloquearse en ${days} día(s), el ${p.streakBlockedUntil}.`,streakBlockedUntil:p.streakBlockedUntil,daysRemaining:days});}
+ const yesterday=shiftDate(today,-1);let day=1;
+ if(p.streakLastClaimDate===yesterday)day=Math.min(7,(p.streakCount||0)+1);
+ else{p.streakCycleStartDate=today;p.streakRewards=makeStreakRewards();}
+ if(!Array.isArray(p.streakRewards)||p.streakRewards.length!==7)p.streakRewards=makeStreakRewards();
+ p.streakCount=day;const prize=p.streakRewards[day-1]||{type:'coins',amount:[100,200,300,400,500,700,1000][day-1]};
+ const granted=applyStreakPrize(p,prize,today);p.streakLastClaimDate=today;p.streakClaimedToday=true;p.streakBlockedUntil=null;ensureDailyQuests(p,today);
+ const u=await client.query('UPDATE ssi_users SET profile=$1::jsonb,updated_at=NOW() WHERE id=$2 RETURNING id,username,profile,created_at,role',[JSON.stringify(p),row.id]);await client.query('COMMIT');res.json({user:publicUser(u.rows[0]),day,prize:granted,coins:granted.type==='coins'?granted.amount:0,weeklyReward:granted.type==='weekly'?granted:null});
+ }catch(e){await client.query('ROLLBACK').catch(()=>{});jsonError(res,e);}finally{client.release();}
+});
+app.post('/api/daily/progress', requireAuth, async(req,res)=>{
+ const type=String(req.body?.type||'');const amount=clampInt(req.body?.amount,0,10000,0);if(!['damage','matches','wins','specials'].includes(type)||!amount)return res.status(400).json({error:'Progreso no válido.'});
+ const client=await pool.connect();try{await client.query('BEGIN');const q=await client.query('SELECT id,profile FROM ssi_users WHERE id=$1 FOR UPDATE',[req.session.userId]);if(!q.rowCount){await client.query('ROLLBACK');return res.status(401).json({error:'Inicia sesión otra vez.'});}
+ const p=safeProfile(q.rows[0].profile);ensureDailyQuests(p,utcDate());for(const quest of p.dailyQuests){if(quest.type===type&&!quest.claimed){quest.progress=Math.min(quest.target,quest.progress+amount);quest.completed=quest.progress>=quest.target;}}
+ const u=await client.query('UPDATE ssi_users SET profile=$1::jsonb,updated_at=NOW() WHERE id=$2 RETURNING id,username,profile,created_at,role',[JSON.stringify(p),q.rows[0].id]);await client.query('COMMIT');res.json({user:publicUser(u.rows[0])});
+ }catch(e){await client.query('ROLLBACK').catch(()=>{});jsonError(res,e);}finally{client.release();}
+});
+app.post('/api/daily/quest/claim', requireAuth, async(req,res)=>{
+ const id=String(req.body?.questId||'');const client=await pool.connect();try{await client.query('BEGIN');const q=await client.query('SELECT id,username,profile,created_at,role FROM ssi_users WHERE id=$1 FOR UPDATE',[req.session.userId]);if(!q.rowCount){await client.query('ROLLBACK');return res.status(401).json({error:'Inicia sesión otra vez.'});}
+ const row=q.rows[0],p=safeProfile(row.profile);ensureDailyQuests(p,utcDate());const quest=p.dailyQuests.find(x=>x.id===id);if(!quest){await client.query('ROLLBACK');return res.status(404).json({error:'Misión no encontrada.'});}if(!quest.completed||quest.claimed){await client.query('ROLLBACK');return res.status(400).json({error:'La misión no está lista para reclamar.'});}
+ quest.claimed=true;const rewardType=quest.rewardType==='cups'?'cups':'coins';if(rewardType==='cups')p.cups=Math.min(2000000000,p.cups+quest.reward);else p.coins=Math.min(2000000000,p.coins+quest.reward);
+ const u=await client.query('UPDATE ssi_users SET profile=$1::jsonb,updated_at=NOW() WHERE id=$2 RETURNING id,username,profile,created_at,role',[JSON.stringify(p),row.id]);await client.query('COMMIT');res.json({user:publicUser(u.rows[0]),reward:quest.reward,rewardType});
+ }catch(e){await client.query('ROLLBACK').catch(()=>{});jsonError(res,e);}finally{client.release();}
+});
+
+app.get('/api/ranking', requireAuth, async (_req, res) => {
+  try {
+    const result = await pool.query(`SELECT username, COALESCE((profile->>'cups')::bigint, 0) AS cups FROM ssi_users ORDER BY COALESCE((profile->>'cups')::bigint, 0) DESC, username_key ASC LIMIT 50`);
+    res.json({ ranking: result.rows.map(row => ({ username: row.username, cups: Number(row.cups) || 0 })) });
+  } catch (error) { jsonError(res, error); }
+});
+
+app.use('/api', (_req, res) => res.status(404).json({ error: 'Ruta de API no encontrada.' }));
+app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'], maxAge: IS_PRODUCTION ? '1h' : 0 }));
+app.get(/.*/, (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.use((error, _req, res, _next) => {
+  if (error?.type === 'entity.too.large') return res.status(413).json({ error: 'La solicitud es demasiado grande.' });
+  console.error(error);
+  res.status(500).json({ error: 'Error inesperado del servidor.' });
+});
+
+async function initializeDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ssi_users (
+      id UUID PRIMARY KEY,
+      username VARCHAR(16) NOT NULL,
+      username_key VARCHAR(16) NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      role VARCHAR(16) NOT NULL DEFAULT 'player' CHECK (role IN ('player','admin')),
+      profile JSONB NOT NULL DEFAULT '{"coins":0,"cups":0,"wins":0,"unlockedChars":["warrior"],"selectedChar":"warrior","keyBindings":{},"touchPositions":{},"forceTouch":false}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    ALTER TABLE ssi_users ADD COLUMN IF NOT EXISTS role VARCHAR(16) NOT NULL DEFAULT 'player';
+    ALTER TABLE ssi_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    CREATE TABLE IF NOT EXISTS ssi_admin_logs (
+      id BIGSERIAL PRIMARY KEY,
+      admin_id UUID NOT NULL REFERENCES ssi_users(id) ON DELETE CASCADE,
+      action VARCHAR(64) NOT NULL,
+      target_user_id UUID REFERENCES ssi_users(id) ON DELETE SET NULL,
+      details JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS ssi_admin_logs_created_idx ON ssi_admin_logs(created_at DESC);
+    CREATE TABLE IF NOT EXISTS ssi_matches (
+      id UUID PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES ssi_users(id) ON DELETE CASCADE,
+      mode VARCHAR(20) NOT NULL,
+      difficulty VARCHAR(20) NOT NULL,
+      started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      finished_at TIMESTAMPTZ,
+      result VARCHAR(10),
+      reward_coins BIGINT NOT NULL DEFAULT 0,
+      reward_cups BIGINT NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS ssi_matches_user_started_idx ON ssi_matches(user_id, started_at DESC);
+    DELETE FROM ssi_matches WHERE started_at < NOW() - INTERVAL '30 days';
+  `);
+}
+
+await initializeDatabase();
+const server = app.listen(PORT, '0.0.0.0', () => console.log(`Super Smash Island Cloud activo en el puerto ${PORT}`));
+async function shutdown(signal) {
+  console.log(`Recibida señal ${signal}; cerrando servidor...`);
+  server.close(() => {});
+  await pool.end().catch(() => {});
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
