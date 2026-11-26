@@ -1,0 +1,35 @@
+SUPER SMASH ISLAND CLOUD - AUDITORIA V5
+Fecha: 2026-11-26
+
+CAMBIOS
+- Titulo con 50% azul y 50% rojo, contorno claro y pulso neon moderado.
+- Cola local de eventos para partidas y compras offline.
+- Sincronizacion automatica al recuperar internet o al iniciar otra partida.
+- Recompensas offline para Bot, Zombies y Arcade con formulas alineadas a las del servidor.
+- Compras offline de personajes y accesorios quedan pendientes y se aplican en orden.
+- La sincronizacion usa IDs unicos y una tabla ssi_offline_events para impedir aplicar dos veces el mismo evento.
+- Si la respuesta de una partida online se pierde, el matchId permite reconciliar sin duplicar la recompensa.
+- La dificultad de Zombies se normaliza antes de enviar el evento, evitando que el servidor rechace sus recompensas offline.
+
+REVISION DE RECOMPENSAS
+- Bot: mismas monedas y formula de copas del servidor para normal/hard/nightmare.
+- Zombies: monedas por oleada, bonificacion de jefe y multiplicador de copas alineados con el servidor.
+- Arcade: premios por minijuego y modo lava calculados con las mismas reglas del servidor.
+- Las copas se limitan a cero como en el perfil online; se muestra el delta realmente aplicado.
+- Los eventos se procesan en orden, para que monedas ganadas offline se apliquen antes de descontar compras posteriores.
+
+VALIDACION ESTATICA
+- node --check server.js: correcto.
+- Scripts inline de index.html: comprobacion de sintaxis.
+- IDs HTML duplicados: ninguno detectado.
+- ZIP: integridad verificada.
+
+NO PROBADO
+- No se hizo una prueba real en navegador/dispositivo sin internet.
+- No se ejecutó una partida real contra Neon ni una prueba multijugador de dos clientes.
+- Revisar el despliegue en Render y probar una partida offline corta/larga antes de considerarlo estable.
+
+SEGURIDAD
+- Limite de 15 partidas offline sincronizables por cuenta y dia UTC.
+- La partida PvP no se acepta por el flujo offline.
+- Una partida offline no puede verificarse completamente desde el servidor; los topes de tiempo/oleadas reducen abuso, pero no lo eliminan.
